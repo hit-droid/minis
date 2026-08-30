@@ -2,9 +2,11 @@ name: TraeWork 每日签到
 
 on:
   schedule:
-    # UTC 时间 = 北京时间 - 8。01:05 UTC = 北京 09:05
-    - cron: "5 1 * * *"
-    - cron: "35 3 * * *"   # 北京 11:35 兜底一次（幂等，已签到会跳过）
+    # UTC 时间 = 北京时间 - 8。四次错峰，任一次成功即幂等跳过。
+    - cron: "5 1 * * *"    # 北京 09:05 主跑
+    - cron: "35 3 * * *"   # 北京 11:35 兜底
+    - cron: "5 7 * * *"    # 北京 15:05 兜底
+    - cron: "40 13 * * *"  # 北京 21:40 当日最后机会
   workflow_dispatch: {}
   workflow_call: {}
 
@@ -31,4 +33,16 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           GIST_ID: ${{ secrets.GIST_ID }}
           TRAE_CRED: ${{ secrets.TRAE_CRED }}
+          RUNNER: github-actions
         run: python trae_auto/checkin.py
+
+      - name: 失败时再试一次
+        if: failure()
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          TRAE_CRED: ${{ secrets.TRAE_CRED }}
+          RUNNER: github-actions-retry
+        run: |
+          sleep 120
+          python trae_auto/checkin.py
