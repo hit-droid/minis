@@ -1,0 +1,34 @@
+name: TraeWork 每日签到
+
+on:
+  schedule:
+    # UTC 时间 = 北京时间 - 8。01:05 UTC = 北京 09:05
+    - cron: "5 1 * * *"
+    - cron: "35 3 * * *"   # 北京 11:35 兜底一次（幂等，已签到会跳过）
+  workflow_dispatch: {}
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trae-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 执行签到
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          TRAE_CRED: ${{ secrets.TRAE_CRED }}
+        run: python trae_auto/checkin.py
