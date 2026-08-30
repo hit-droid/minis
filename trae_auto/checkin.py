@@ -2,8 +2,12 @@
 # -*- coding: utf-8 -*-
 """TraeWork 每日自动签到 —— 云端无头版（GitHub Actions / 任意 cron 环境）
 
-与本地 trae_checkin.py 的区别：凭证不存文件，而是存在一个**私有 Gist** 里，
-每次运行读回、刷新后写回，因此 token 轮换不会丢状态。
+凭证存在一个**私有 Gist** 里，每次运行读回、刷新后写回，因此 token 轮换不会丢状态。
+
+同一个 Gist 里还有第二个文件 status.json，是**跨运行器的记账本**：
+任何 runner（GitHub Actions、手机、别的机器）开工前先读它，发现今天已经
+成功就直接退出。这样多个保底源不会互相重复劳动，也让"今天到底签没签"
+变成一个可以一眼查到的事实，而不是要靠猜。
 
 需要的环境变量
   GH_PAT       GitHub Personal Access Token，只要 **gist** 一个 scope
@@ -11,6 +15,12 @@
 
 可选
   TRAE_CRED    base64(JSON) 初始凭证；首次运行时用它来建 Gist，之后不再需要
+  RUNNER       本次运行者的标识，写进记账本便于排查是谁签的
+
+子命令
+  (默认)       检查记账本 → 未签到则签到 → 写记账本
+  status       只报告今天状态，不签到（exit 0=已完成, 3=未完成）
+  local        纯本地模式，不碰 Gist（应急，token 轮换不会保存）
 
 纯标准库，无第三方依赖。
 """
@@ -30,7 +40,44 @@ API_HOST = "https://api.trae.cn"
 CLAIM_PATH = "/trae/api/v2/ug/checkin_credits/claim"
 STATUS_PATH = "/trae/api/v2/ug/checkin_credits/status"
 EXCHANGE = f"{AUTH_BASE}/cloudide/api/v3/trae/oauth/ExchangeToken"
-GIST_FILE = "trae_cred.json"
+
+CRED_FILE = "trae_cred.json"
+LOG_FILE = "status.json"
+# Trae 是 CN 服务，日界按北京时间算，不能依赖 runner 自己的时区
+CN_TZ = 8 * 3600
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _cred_candidates():
+    """本地凭证镜像的可能位置。
+
+    仓库布局是 trae_auto/checkin.py + 同级 trae_cred.json，而跨会话的
+    shared 目录是扁平放法，所以两种都要试。
+    """
+    return [os.path.join(_HERE, "trae_cred.json"),
+            os.path.abspath(os.path.join(_HERE, "..", "trae_cred.json")),
+            "/var/minis/shared/trae_checkin/trae_cred.json",
+            os.path.expanduser("~/.trae_checkin/cred.json")]
+
+
+def _cred_target():
+    """写入目标：已存在的第一个，否则用最后一个（持久目录）。"""
+    for p in _cred_candidates():
+        if os.path.exists(p):
+            return p
+    return _cred_candidates()[-1]
+
+
+LOCAL_CRED = None  # 兼容旧引用；实际路径由 _cred_target() 决定
+
+
+def today():
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + CN_TZ))
+
+
+def now():
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + CN_TZ))
 
 
 # ------------------------------------------------------------------ http
@@ -53,6 +100,7 @@ def http(method, url, headers=None, body=None, timeout=25):
 
 def http_json(method, url, headers=None, body=None, tries=4):
     """带重试的 JSON 请求 —— 这个 API 网关经常直接断连，必须重试。"""
+    st, raw = 0, ""
     for i in range(tries):
         st, raw = http(method, url, headers, body)
         if st and raw:
@@ -73,29 +121,34 @@ def gh(headers=None):
             "X-GitHub-Api-Version": "2022-11-28", **(headers or {})}
 
 
-def gist_load(gist_id):
+def gist_load_all(gist_id):
+    """返回 ({cred: dict|None, log: dict|None})；Gist 不可达返回 None。"""
     st, raw = http("GET", f"https://api.github.com/gists/{gist_id}", gh())
     if st != 200:
         return None
     try:
-        content = json.loads(raw)["files"][GIST_FILE]["content"]
-        return json.loads(content)
+        files = json.loads(raw)["files"]
     except Exception:
         return None
 
+    def pick(name):
+        f = files.get(name)
+        if not f or f.get("content") is None:
+            return None
+        try:
+            return json.loads(f["content"])
+        except Exception:
+            return None
 
-def gist_create(cred):
-    payload = {"public": False,
-               "description": "TraeWork 签到凭证（自动维护，勿手改）",
-               "files": {GIST_FILE: {"content": json.dumps(cred, ensure_ascii=False, indent=2)}}}
-    st, raw = http("POST", "https://api.github.com/gists", gh(), payload)
-    if st not in (200, 201):
-        print("❌ 创建 Gist 失败：", raw[:300]); sys.exit(4)
-    return json.loads(raw)["id"]
+    return {"cred": pick(CRED_FILE), "log": pick(LOG_FILE)}
 
 
-def gist_save(gist_id, cred):
-    payload = {"files": {GIST_FILE: {"content": json.dumps(cred, ensure_ascii=False, indent=2)}}}
+def gist_save(gist_id, cred, log=None):
+    """PATCH 会**替换整个文件集合**，漏传的文件会被删掉 —— 所以两个文件必须一起发。"""
+    files = {CRED_FILE: {"content": json.dumps(cred, ensure_ascii=False, indent=2)}}
+    if log is not None:
+        files[LOG_FILE] = {"content": json.dumps(log, ensure_ascii=False, indent=2)}
+    payload = {"files": files}
     st, raw = http("PATCH", f"https://api.github.com/gists/{gist_id}", gh(), payload)
     if st != 200:
         print("⚠ 写回 Gist 失败：", raw[:200])
@@ -103,12 +156,65 @@ def gist_save(gist_id, cred):
     return True
 
 
-def persist(gist_id, has_gh, cred):
-    """把（可能已轮换的）凭证写回 Gist；本地模式静默跳过。"""
-    if has_gh and gist_id:
-        gist_save(gist_id, cred)
-    else:
-        print("ℹ 本地模式：跳过 Gist 回写")
+def gist_create(cred, log):
+    payload = {"public": False,
+               "description": "TraeWork 签到凭证 + 状态记账本（自动维护，勿手改）",
+               "files": {CRED_FILE: {"content": json.dumps(cred, ensure_ascii=False, indent=2)},
+                         LOG_FILE: {"content": json.dumps(log, ensure_ascii=False, indent=2)}}}
+    st, raw = http("POST", "https://api.github.com/gists", gh(), payload)
+    if st not in (200, 201):
+        print("❌ 创建 Gist 失败：", raw[:300])
+        sys.exit(4)
+    return json.loads(raw)["id"]
+
+
+def load_local_cred():
+    """Gist 完全不可达时的最后一道保险：读本地凭证镜像。"""
+    for p in _cred_candidates():
+        try:
+            with open(p, encoding="utf-8") as f:
+                d = json.load(f)
+            if d.get("accessToken"):
+                return d
+        except Exception:
+            continue
+    return None
+
+
+def save_local_cred(cred):
+    """更新本地凭证镜像 —— 但**仅当某个候选位置已存在**时才写。
+
+    这条规则同时解决了两件事：
+      · 云端 runner 是一次性环境，checkout 出来的仓库里没有这个文件，
+        所以不会把明文凭证白白写到别人的磁盘上（少一个泄露面）；
+      · 本地/手机这类持久环境里文件存在，token 轮换后能及时落盘，
+        成为 Gist 不可达时的救命备份。
+    """
+    p = _cred_target()
+    if not os.path.exists(p):
+        return
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cred, f, ensure_ascii=False, indent=2)
+        os.chmod(p, 0o600)
+    except Exception as e:
+        print("⚠ 本地凭证镜像写入失败：", str(e)[:80])
+
+
+# ------------------------------------------------------------------ 记账本
+def log_done(log):
+    return bool((log or {}).get("days", {}).get(today(), {}).get("ok"))
+
+
+def log_record(log, ok, note="", credits=None, runner=None):
+    """只保留最近 60 天，避免 Gist 无限膨胀。"""
+    log = log or {}
+    days = log.setdefault("days", {})
+    days[today()] = {"ok": bool(ok), "at": now(), "note": note[:200],
+                     "credits": credits, "runner": runner or os.environ.get("RUNNER", "unknown")}
+    for old in sorted(days)[:-60]:
+        days.pop(old, None)
+    return log
 
 
 # ------------------------------------------------------------------ trae
@@ -160,50 +266,22 @@ def ensure_valid(c):
     return c
 
 
-def main():
-    has_gh = bool(os.environ.get("GH_PAT"))
-    if not has_gh:
-        print("⚠ 未设置 GH_PAT：本次为纯本地模式，不会读写 Gist，"
-              "轮换后的 token 也不会保存")
+def query_status(cred):
+    """只读查询 Trae 侧签到状态。绝不发 claim。"""
+    return http_json("POST", API_HOST + STATUS_PATH, hdrs(cred), {})
 
-    gist_id = os.environ.get("GIST_ID", "").strip() if has_gh else ""
-    cred = gist_load(gist_id) if gist_id else None
 
-    if cred is None:
-        seed = os.environ.get("TRAE_CRED", "").strip()
-        if not seed:
-            print("❌ Gist 里没有凭证，且未提供 TRAE_CRED 初始值")
-            print("   先在本地跑 trae_checkin.py 绑定，再把 trae_cred.json base64 后填入 secret")
-            return 2
-        cred = json.loads(base64.b64decode(seed).decode())
-        if not has_gh:
-            print("✔ 已从 TRAE_CRED 载入凭证（本地模式）")
-        elif gist_id:
-            if not gist_save(gist_id, cred):
-                return 2
-            print(f"✔ 已用 TRAE_CRED 初始化 Gist {gist_id}")
-        else:
-            gist_id = gist_create(cred)
-            print(f"✔ 已自动创建私有 Gist，GIST_ID = {gist_id}")
-            print(f"   请把它填到仓库 secret：GIST_ID={gist_id}")
-            return 0
-
-    cred = ensure_valid(cred)
-    if cred is None:
-        return 3
-
-    s = http_json("POST", API_HOST + STATUS_PATH, hdrs(cred), {})
+def do_claim(cred):
+    """执行签到。返回 (ok, note, credits)。"""
+    s = query_status(cred)
     print("status:", json.dumps(s, ensure_ascii=False)[:200])
     if s.get("code") != 0:
-        print("❌ 状态查询失败"); return 1
+        return False, f"status 查询失败: {s.get('_raw') or s}", None
     if not s.get("enable"):
-        print("ℹ 该账号未开启签到活动"); return 0
+        return True, "该账号未开启签到活动", None
     if s.get("checked_in"):
-        print("✔ 今日已签到，跳过")
-        persist(gist_id, has_gh, cred)
-        return 0
+        return True, "今日已签到（Trae 侧确认）", s.get("credits")
 
-    ok = False
     for attempt in range(6):
         r = http_json("POST", API_HOST + CLAIM_PATH, hdrs(cred), {}, tries=3)
         code = r.get("code")
@@ -211,7 +289,7 @@ def main():
         print(f"[{time.strftime('%H:%M:%S')}] claim -> {json.dumps(r, ensure_ascii=False)[:160]}")
 
         if code == 0:
-            print("✅ 签到成功"); ok = True; break
+            return True, "签到成功", 200
 
         if code == 9074:
             if attempt == 0 and not re.fullmatch(r"\d{16}", str(cred.get("deviceId", ""))):
@@ -219,17 +297,145 @@ def main():
                 print("⚠ 9074：设备号格式不对，已换成 Aha 16 位号重试")
                 continue
             wait = min(25 * (attempt + 1), 90)
-            print(f"⚠ 限流/风控，{wait}s 后重试"); time.sleep(wait); continue
+            print(f"⚠ 限流/风控，{wait}s 后重试")
+            time.sleep(wait)
+            continue
 
         if "已签到" in msg or "已领取" in msg:
-            print("✔ 今日已签到"); ok = True; break
+            return True, "今日已签到", s.get("credits")
 
-        print("❌ 签到失败"); break
+        return False, f"claim 失败 code={code} msg={msg}", None
 
-    if gist_id:
-        gist_save(gist_id, cred)
-    elif not has_gh:
-        print("ℹ 本地模式：跳过 Gist 回写")
+    return False, "重试 6 次仍失败（限流/风控）", None
+
+
+# ------------------------------------------------------------------ main
+def run_status():
+    """只读体检：记账本 + Trae 真实状态。任何情况下都不发 claim。
+
+    exit 0 = 今日已完成；3 = 未完成/无法确认。
+    """
+    print(f"日期(北京): {today()}")
+    gist_id = os.environ.get("GIST_ID", "").strip()
+    log, cred = None, None
+    if gist_id and os.environ.get("GH_PAT"):
+        b = gist_load_all(gist_id)
+        if b:
+            log, cred = b["log"], b["cred"]
+            d = (log or {}).get("days", {}).get(today())
+            if d:
+                print(f"  记账本: {'ok' if d.get('ok') else 'fail'} @ {d.get('at')} "
+                      f"| {d.get('runner')} | {d.get('note')}")
+            else:
+                print("  记账本: 今日无记录")
+        else:
+            print("  记账本: Gist 不可达")
+
+    # Trae 侧查询优先用 Gist 里的凭证（那是轮换后的最新 token），
+    # 本地镜像可能落后一个版本，只作兜底。
+    if not cred:
+        cred = load_local_cred()
+    if not cred:
+        print("❌ 无凭证可查 Trae 状态")
+        d = (log or {}).get("days", {}).get(today())
+        return 0 if d and d.get("ok") else 3
+
+    s = query_status(cred)
+    print("  Trae 侧:", json.dumps(s, ensure_ascii=False)[:200])
+    if s.get("code") == 0 and s.get("checked_in"):
+        print(f"✔ 今日已签到 | credits={s.get('credits')}")
+        return 0
+    if s.get("code") == 0 and not s.get("enable"):
+        print("ℹ 该账号未开启签到活动")
+        return 0
+    if s.get("code") not in (None, 0) and (s.get("code") in (20101, 20102)
+                                           or "Token" in str(s.get("message", ""))):
+        print("⚠ token 已失效，需人工重新绑定")
+    else:
+        print("✘ 今日尚未签到")
+    return 3
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if mode == "status":
+        return run_status()
+
+    has_gh = bool(os.environ.get("GH_PAT")) and os.environ.get("GIST_ID", "").strip()
+    gist_id = os.environ.get("GIST_ID", "").strip()
+
+    # ---- 纯本地应急模式：完全不碰 Gist
+    if mode == "local" or not has_gh:
+        if mode != "local":
+            print("⚠ 未设置 GH_PAT/GIST_ID：纯本地模式，token 轮换不会保存")
+        cred = load_local_cred()
+        if cred is None:
+            seed = os.environ.get("TRAE_CRED", "").strip()
+            if not seed:
+                print("❌ 既无 Gist 也无本地凭证，无法签到")
+                return 2
+            cred = json.loads(base64.b64decode(seed).decode())
+        cred = ensure_valid(cred)
+        if cred is None:
+            return 3
+        ok, note, credits = do_claim(cred)
+        save_local_cred(cred)
+        print(("✅ " if ok else "❌ ") + note)
+        return 0 if ok else 1
+
+    # ---- 正常模式：以 Gist 为准
+    bundle = gist_load_all(gist_id)
+    if bundle is None:
+        print("⚠ Gist 不可达，降级到本地凭证")
+        cred = load_local_cred()
+        if cred is None:
+            seed = os.environ.get("TRAE_CRED", "").strip()
+            cred = json.loads(base64.b64decode(seed).decode()) if seed else None
+        if cred is None:
+            print("❌ Gist 读不到，且无本地备份/初始凭证")
+            return 2
+        cred = ensure_valid(cred)
+        if cred is None:
+            return 3
+        ok, note, credits = do_claim(cred)
+        save_local_cred(cred)
+        print(("✅ " if ok else "❌ ") + note + "（记账本未更新）")
+        return 0 if ok else 1
+
+    cred, log = bundle["cred"], bundle["log"]
+
+    if cred is None:
+        seed = os.environ.get("TRAE_CRED", "").strip()
+        if not seed:
+            print("❌ Gist 里没有凭证，且未提供 TRAE_CRED 初始值")
+            return 2
+        cred = json.loads(base64.b64decode(seed).decode())
+        if not gist_save(gist_id, cred, log_record(log, False, "初始化")):
+            return 2
+        print(f"✔ 已用 TRAE_CRED 初始化 Gist {gist_id}")
+
+    # ---- 保底协调：记账本说今天成功了，还要不要问 Trae？
+    # 要。记账本可能因为写回失败而落后于事实，而 Trae 的 status 才是真相。
+    # 但反过来说，记账本成功 + status 也确认已签到时，就绝不再发 claim。
+    before = cred
+    cred = ensure_valid(cred)
+    if cred is None:
+        # ⚠ 绝不能写 {} 回去 —— PATCH 会替换文件，凭证会被清空，
+        # 那等于把 refreshToken 也丢了，只能人工重新绑定。原样保存旧凭证。
+        gist_save(gist_id, before,
+                  log_record(log, False, "refreshToken 失效，需人工重新绑定"))
+        return 3
+
+    ok, note, credits = do_claim(cred)
+    log = log_record(log, ok, note, credits)
+    save_local_cred(cred)
+    if not gist_save(gist_id, cred, log):
+        print("⚠ 记账本写回失败（不影响本次签到结果）")
+
+    print(("✅ " if ok else "❌ ") + note)
     return 0 if ok else 1
 
 
