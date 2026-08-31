@@ -40,8 +40,21 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           GIST_ID: ${{ secrets.GIST_ID }}
           TRAE_CRED: ${{ secrets.TRAE_CRED }}
+          TRAE_PROXY: ${{ secrets.TRAE_PROXY }}
           RUNNER: github-actions
         run: |
+          # 云端 runner 出口在美国（实测 4.246.62.229 / Microsoft），
+          # Trae 的 claim 接口对境外 IP 返回误导性 9074，故需中国代理。
+          # urllib 原生尊重 http_proxy/https_proxy，无需改代码。
+          if [ -n "$TRAE_PROXY" ]; then
+            export http_proxy="$TRAE_PROXY" https_proxy="$TRAE_PROXY"
+            # GitHub API 绝不能走代理：会拖慢/失败，且无必要
+            export no_proxy="api.github.com,gist.githubusercontent.com,raw.githubusercontent.com"
+            export NO_PROXY="$no_proxy"
+            echo "已启用代理出口（GitHub API 直连）"
+          else
+            echo "未配置 TRAE_PROXY —— 将以美国 IP 直连，claim 预计失败"
+          fi
           if [ "${{ github.event.inputs.mode }}" = "run" ]; then
             python trae_auto/checkin.py || python trae_auto/checkin.py
           else
