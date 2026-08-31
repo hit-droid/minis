@@ -1,14 +1,21 @@
 name: TraeWork 每日签到
 
-# ⚠ schedule 已整段停用（2026-08-31）：云端出口为境外 IP，claim 必失败(9074)。
-#   注意 `schedule:` 不能只留注释——空列表会让整个 workflow 解析失败。
-#   恢复时把下面这段取消注释并放回 on: 之下：
-#     schedule:
-#       - cron: "5 1 * * *"    # 北京 09:05
-#       - cron: "35 3 * * *"   # 北京 11:35
-#       - cron: "5 7 * * *"    # 北京 15:05
-#       - cron: "40 13 * * *"  # 北京 21:40
+# 2026-08-31 更新：经本地沙箱实测确认，code 9074 是真限流，不是地域风控
+# （国内 IP 175.5.52.228 / Chinanet 也 6 次全 9074）。
+# 但 Actions 跑在 Azure 美国 IP 段（4.246.62.229），与本地/国内家用
+# IP 段分属不同限流桶，多段错峰 = 多个独立尝试 + 不同计数器，叠加更稳。
+# 策略：8 个时间点错峰，每点失败时 2 分钟后自动重试一次（双保险）。
+# 记账本（status.json）已经做幂等，不会重复领。
 on:
+  schedule:
+    - cron: "5 1 * * *"    # 北京 09:05
+    - cron: "45 2 * * *"   # 北京 10:45
+    - cron: "25 4 * * *"   # 北京 12:25
+    - cron: "5 6 * * *"    # 北京 14:05
+    - cron: "45 7 * * *"   # 北京 15:45
+    - cron: "25 9 * * *"   # 北京 17:25
+    - cron: "0 12 * * *"   # 北京 20:00
+    - cron: "30 14 * * *"  # 北京 22:30
   workflow_dispatch:
     inputs:
       mode:
@@ -35,7 +42,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 执行
+      - name: 执行（首次）
+        id: first
+        continue-on-error: true
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           GIST_ID: ${{ secrets.GIST_ID }}
@@ -43,20 +52,34 @@ jobs:
           TRAE_PROXY: ${{ secrets.TRAE_PROXY }}
           RUNNER: github-actions
         run: |
-          # 云端 runner 出口在美国（实测 4.246.62.229 / Microsoft），
-          # Trae 的 claim 接口对境外 IP 返回误导性 9074，故需中国代理。
-          # urllib 原生尊重 http_proxy/https_proxy，无需改代码。
           if [ -n "$TRAE_PROXY" ]; then
             export http_proxy="$TRAE_PROXY" https_proxy="$TRAE_PROXY"
-            # GitHub API 绝不能走代理：会拖慢/失败，且无必要
             export no_proxy="api.github.com,gist.githubusercontent.com,raw.githubusercontent.com"
             export NO_PROXY="$no_proxy"
             echo "已启用代理出口（GitHub API 直连）"
           else
-            echo "未配置 TRAE_PROXY —— 将以美国 IP 直连，claim 预计失败"
+            echo "未配置 TRAE_PROXY —— 直连美国 IP 段，仍可签（限流独立桶）"
           fi
           if [ "${{ github.event.inputs.mode }}" = "run" ]; then
-            python trae_auto/checkin.py || python trae_auto/checkin.py
+            python trae_auto/checkin.py
           else
             python trae_auto/checkin.py dry
           fi
+
+      - name: 失败重试（仅当首次失败）
+        if: steps.first.outcome == 'failure' && github.event_name == 'schedule'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          TRAE_CRED: ${{ secrets.TRAE_CRED }}
+          TRAE_PROXY: ${{ secrets.TRAE_PROXY }}
+          RUNNER: github-actions-retry
+        run: |
+          echo "首次失败，2 分钟后重试（限流窗口可能已冷）"
+          sleep 120
+          if [ -n "$TRAE_PROXY" ]; then
+            export http_proxy="$TRAE_PROXY" https_proxy="$TRAE_PROXY"
+            export no_proxy="api.github.com,gist.githubusercontent.com,raw.githubusercontent.com"
+            export NO_PROXY="$no_proxy"
+          fi
+          python trae_auto/checkin.py
