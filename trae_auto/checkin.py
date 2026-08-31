@@ -206,12 +206,15 @@ def log_done(log):
     return bool((log or {}).get("days", {}).get(today(), {}).get("ok"))
 
 
-def log_record(log, ok, note="", credits=None, runner=None):
+def log_record(log, ok, note="", credits=None, runner=None, egress=None):
     """只保留最近 60 天，避免 Gist 无限膨胀。"""
     log = log or {}
     days = log.setdefault("days", {})
-    days[today()] = {"ok": bool(ok), "at": now(), "note": note[:200],
-                     "credits": credits, "runner": runner or os.environ.get("RUNNER", "unknown")}
+    entry = {"ok": bool(ok), "at": now(), "note": note[:200],
+             "credits": credits, "runner": runner or os.environ.get("RUNNER", "unknown")}
+    if egress:
+        entry["egress"] = f"{egress.get('cc')}/{egress.get('ip')}"
+    days[today()] = entry
     for old in sorted(days)[:-60]:
         days.pop(old, None)
     return log
@@ -271,16 +274,75 @@ def query_status(cred):
     return http_json("POST", API_HOST + STATUS_PATH, hdrs(cred), {})
 
 
+def run_dry(cred):
+    """取证模式：只探测出口 IP + 查状态，**绝不发 claim**。
+
+    存在理由：需要确认云端 runner 的出口地域，但当天尚未签到，
+    直接跑主流程会真的把积分领掉，污染观察结果。
+    """
+    e = egress_info()
+    print(f"runner={os.environ.get('RUNNER','?')} 出口={e['ip']} | {e['country']} ({e['cc']}) | {e['isp']}")
+    s = query_status(cred)
+    print("Trae 侧:", json.dumps(s, ensure_ascii=False)[:200])
+    if e["cc"] == "CN":
+        print("→ 出口在中国大陆，claim 应可正常执行")
+        return 0
+    print("→ 出口不在中国大陆。若此前 claim 返回 9074，基本可判定为地域风控，"
+          "重试/错峰无效，需中国 IP 代理。")
+    return 4
+
+
+def egress_info():
+    """探测本次请求的出口 IP 与国家。
+
+    存在理由：9074 曾被误判为限流，实际高度怀疑是**境外 IP 触发地域风控**
+    （Trae 是纯 CN 服务，请求头还写着 X-User-Region: CN）。
+    没有这条数据，重试和错峰都是盲调。
+    """
+    srcs = [("http://ip-api.com/json/?fields=country,countryCode,isp,query",
+             ("countryCode", "country", "isp", "query")),
+            ("https://api.ip.sb/geoip", ("country_code", "country", "isp", "ip")),
+            ("https://ipinfo.io/json", ("country", "country", "org", "ip"))]
+    # 沙箱网络会随机 DNS 失败/断连，单发一次必然偶发 unknown，
+    # 而 unknown 会让地域判断退化成"不敢下结论"，所以每个源都重试一轮。
+    for rnd in range(3):
+        for url, (kcc, kcty, kisp, kip) in srcs:
+            st, raw = http("GET", url, timeout=12)
+            if st != 200 or not raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            cc = (d.get(kcc) or "?").upper()
+            if cc == "?":
+                continue
+            return {"cc": cc, "country": d.get(kcty, "?"),
+                    "isp": d.get(kisp, "?"), "ip": d.get(kip, "?")}
+        time.sleep(2)
+    return {"cc": "?", "country": "unknown", "isp": "unknown", "ip": "unknown"}
+
+
 def do_claim(cred):
-    """执行签到。返回 (ok, note, credits)。"""
+    """执行签到。返回 (ok, note, credits, egress)。"""
     s = query_status(cred)
     print("status:", json.dumps(s, ensure_ascii=False)[:200])
     if s.get("code") != 0:
-        return False, f"status 查询失败: {s.get('_raw') or s}", None
+        return False, f"status 查询失败: {s.get('_raw') or s}", None, None
     if not s.get("enable"):
-        return True, "该账号未开启签到活动", None
+        return True, "该账号未开启签到活动", None, None
     if s.get("checked_in"):
-        return True, "今日已签到（Trae 侧确认）", s.get("credits")
+        return True, "今日已签到（Trae 侧确认）", s.get("credits"), None
+
+    egress = egress_info()
+    print(f"出口: {egress['ip']} | {egress['country']} ({egress['cc']}) | {egress['isp']}")
+
+    # 9074 的真实成因高度怀疑是境外 IP 触发地域风控。若出口不在 CN，
+    # 重试 6 次只是白烧 15 分钟 job 时长并撞 timeout —— 直接快速失败，
+    # 把结论写进记账本，让人（或看门狗）去处理，而不是让日志假装"再试试就好"。
+    if egress["cc"] not in ("CN", "?"):
+        return False, (f"出口 IP 在 {egress['country']}({egress['cc']})，"
+                       f"非中国大陆，疑似地域风控 —— 需中国 IP 代理"), None, egress
 
     for attempt in range(6):
         r = http_json("POST", API_HOST + CLAIM_PATH, hdrs(cred), {}, tries=3)
@@ -289,7 +351,7 @@ def do_claim(cred):
         print(f"[{time.strftime('%H:%M:%S')}] claim -> {json.dumps(r, ensure_ascii=False)[:160]}")
 
         if code == 0:
-            return True, "签到成功", 200
+            return True, "签到成功", 200, egress
 
         if code == 9074:
             if attempt == 0 and not re.fullmatch(r"\d{16}", str(cred.get("deviceId", ""))):
@@ -302,11 +364,11 @@ def do_claim(cred):
             continue
 
         if "已签到" in msg or "已领取" in msg:
-            return True, "今日已签到", s.get("credits")
+            return True, "今日已签到", s.get("credits"), egress
 
-        return False, f"claim 失败 code={code} msg={msg}", None
+        return False, f"claim 失败 code={code} msg={msg}", None, egress
 
-    return False, "重试 6 次仍失败（限流/风控）", None
+    return False, "重试 6 次仍失败（限流/风控）", None, egress
 
 
 # ------------------------------------------------------------------ main
@@ -363,6 +425,18 @@ def main():
         return 0
     if mode == "status":
         return run_status()
+    if mode == "dry":
+        # 取证：不 claim、不写记账本
+        gid = os.environ.get("GIST_ID", "").strip()
+        cr = None
+        if gid and os.environ.get("GH_PAT"):
+            b = gist_load_all(gid)
+            cr = b["cred"] if b else None
+        cr = cr or load_local_cred()
+        if cr is None:
+            print("❌ 无凭证")
+            return 2
+        return run_dry(ensure_valid(cr) or cr)
 
     has_gh = bool(os.environ.get("GH_PAT")) and os.environ.get("GIST_ID", "").strip()
     gist_id = os.environ.get("GIST_ID", "").strip()
@@ -381,7 +455,7 @@ def main():
         cred = ensure_valid(cred)
         if cred is None:
             return 3
-        ok, note, credits = do_claim(cred)
+        ok, note, credits, egress = do_claim(cred)
         save_local_cred(cred)
         print(("✅ " if ok else "❌ ") + note)
         return 0 if ok else 1
@@ -400,7 +474,7 @@ def main():
         cred = ensure_valid(cred)
         if cred is None:
             return 3
-        ok, note, credits = do_claim(cred)
+        ok, note, credits, egress = do_claim(cred)
         save_local_cred(cred)
         print(("✅ " if ok else "❌ ") + note + "（记账本未更新）")
         return 0 if ok else 1
@@ -429,8 +503,8 @@ def main():
                   log_record(log, False, "refreshToken 失效，需人工重新绑定"))
         return 3
 
-    ok, note, credits = do_claim(cred)
-    log = log_record(log, ok, note, credits)
+    ok, note, credits, egress = do_claim(cred)
+    log = log_record(log, ok, note, credits, egress=egress)
     save_local_cred(cred)
     if not gist_save(gist_id, cred, log):
         print("⚠ 记账本写回失败（不影响本次签到结果）")
