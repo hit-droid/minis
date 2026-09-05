@@ -337,14 +337,9 @@ def do_claim(cred):
     egress = egress_info()
     print(f"出口: {egress['ip']} | {egress['country']} ({egress['cc']}) | {egress['isp']}")
 
-    # 9074 的真实成因高度怀疑是境外 IP 触发地域风控。若出口不在 CN，
-    # 重试 6 次只是白烧 15 分钟 job 时长并撞 timeout —— 直接快速失败，
-    # 把结论写进记账本，让人（或看门狗）去处理，而不是让日志假装"再试试就好"。
-    if egress["cc"] not in ("CN", "?"):
-        return False, (f"出口 IP 在 {egress['country']}({egress['cc']})，"
-                       f"非中国大陆，疑似地域风控 —— 需中国 IP 代理"), None, egress
-
-    for attempt in range(6):
+    # 9074 自愈（2026-08-31 实测修正）：deviceId 被 Trae 风控标记后无论 IP 在哪
+    # 都 9074；换新 16 位号立即成功（同日手机 CN IP 实测）。IP 仅记录，不再拦截。
+    for attempt in range(8):
         r = http_json("POST", API_HOST + CLAIM_PATH, hdrs(cred), {}, tries=3)
         code = r.get("code")
         msg = r.get("message") or ""
@@ -354,12 +349,13 @@ def do_claim(cred):
             return True, "签到成功", 200, egress
 
         if code == 9074:
-            if attempt == 0 and not re.fullmatch(r"\d{16}", str(cred.get("deviceId", ""))):
+            if attempt < 3:
                 cred["deviceId"] = aha_device_id()
-                print("⚠ 9074：设备号格式不对，已换成 Aha 16 位号重试")
+                print(f"⚠ 9074：deviceId 疑似被标记，换新号 {cred['deviceId']} 重试")
+                time.sleep(2)
                 continue
             wait = min(25 * (attempt + 1), 90)
-            print(f"⚠ 限流/风控，{wait}s 后重试")
+            print(f"⚠ 9074：已换 3 号仍失败，{wait}s 后退避重试")
             time.sleep(wait)
             continue
 
