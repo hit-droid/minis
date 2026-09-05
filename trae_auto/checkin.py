@@ -284,12 +284,15 @@ def run_dry(cred):
     print(f"runner={os.environ.get('RUNNER','?')} 出口={e['ip']} | {e['country']} ({e['cc']}) | {e['isp']}")
     s = query_status(cred)
     print("Trae 侧:", json.dumps(s, ensure_ascii=False)[:200])
+    # 2026-09-05 修正：dry 只做取证，出口地域不作为失败判定。
+    # 9074 实测根因是 deviceId 被标记（换号即解），与 IP 无关 ——
+    # 境外 IP 也可能成功，境外+旧号失败也不能归因地域。不再 return 4。
     if e["cc"] == "CN":
-        print("→ 出口在中国大陆，claim 应可正常执行")
-        return 0
-    print("→ 出口不在中国大陆。若此前 claim 返回 9074，基本可判定为地域风控，"
-          "重试/错峰无效，需中国 IP 代理。")
-    return 4
+        print("→ 出口在中国大陆")
+    else:
+        print(f"→ 出口在 {e['cc']}（非 CN）。注意：9074 与 IP 无关（deviceId 被标记才是根因），"
+              "此处仅作记录，不代表 claim 会失败。")
+    return 0
 
 
 def egress_info():
