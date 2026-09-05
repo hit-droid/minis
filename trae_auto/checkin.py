@@ -342,6 +342,7 @@ def do_claim(cred):
 
     # 9074 自愈（2026-08-31 实测修正）：deviceId 被 Trae 风控标记后无论 IP 在哪
     # 都 9074；换新 16 位号立即成功（同日手机 CN IP 实测）。IP 仅记录，不再拦截。
+    # 签到成功的 credits 从 status 响应取真实值（免费=150/会员=200），不硬编码。
     for attempt in range(8):
         r = http_json("POST", API_HOST + CLAIM_PATH, hdrs(cred), {}, tries=3)
         code = r.get("code")
@@ -349,7 +350,7 @@ def do_claim(cred):
         print(f"[{time.strftime('%H:%M:%S')}] claim -> {json.dumps(r, ensure_ascii=False)[:160]}")
 
         if code == 0:
-            return True, "签到成功", 200, egress
+            return True, "签到成功", s.get("credits") or 200, egress
 
         if code == 9074:
             if attempt < 3:
@@ -402,6 +403,15 @@ def run_status():
         return 0 if d and d.get("ok") else 3
 
     s = query_status(cred)
+    src_cred = cred  # 保存原始凭证,便于判断 status 是否因 token 失效失败
+    if s.get("code") in (20101, 20102) or "Token" in str(s.get("message", "")):
+        # token 失效但 refreshToken 可能仍有效 —— 先尝试自动续期再查,
+        # 不要一上来就让用户"人工重新绑定"(2026-09-05 审查修正)
+        newcred = refresh(cred)
+        if newcred:
+            cred = newcred
+            s = query_status(cred)
+            save_local_cred(cred)
     print("  Trae 侧:", json.dumps(s, ensure_ascii=False)[:200])
     if s.get("code") == 0 and s.get("checked_in"):
         print(f"✔ 今日已签到 | credits={s.get('credits')}")
