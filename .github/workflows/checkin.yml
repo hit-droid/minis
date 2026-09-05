@@ -23,6 +23,14 @@ on:
         options:
           - dry
           - run
+      keepalive:
+        description: "keepalive = 空提交防 60 天无活动自动禁用 schedule"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 concurrency:
   group: trae-checkin
@@ -73,3 +81,16 @@ jobs:
           echo "首次尝试失败，等待 120 秒后重试一次（避免旧版『串联立即重试』覆盖有效结果的坑）"
           sleep 120
           run_once
+
+      - name: 月度 keepalive（防 60 天无活动禁 schedule）
+        if: github.event.inputs.keepalive == 'true'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          git config user.name "checkin-bot"
+          git config user.email "checkin-bot@users.noreply.github.com"
+          git pull --rebase origin ${GITHUB_REF_NAME} || true
+          date -u +"keepalive %Y-%m-%dT%H:%M:%SZ" >> .keepalive
+          git add .keepalive
+          git commit -m "chore: keepalive $(date -u +%F)" || echo "nothing to commit"
+          git push origin ${GITHUB_REF_NAME}
