@@ -1,0 +1,65 @@
+name: Trae 第二账号签到
+
+# 独立于主账号 checkin.yml —— 不同 Gist、不同 secrets、不同 concurrency group。
+# 触发点与主账号错开（主账号 :05/:25/:45，这里用 :15/:35/:55），
+# 避免两个号在同一时刻打同一台服务器。
+
+on:
+  schedule:
+    - cron: "15 1 * * *"    # 北京 09:15
+    - cron: "35 3 * * *"    # 北京 11:35
+    - cron: "55 5 * * *"    # 北京 13:55
+    - cron: "15 8 * * *"    # 北京 16:15
+    - cron: "35 10 * * *"   # 北京 18:35
+    - cron: "55 12 * * *"   # 北京 20:55
+    - cron: "15 14 * * *"   # 北京 22:15
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "status = 只读体检 | run = 正常签到"
+        required: false
+        default: "status"
+        type: choice
+        options:
+          - status
+          - run
+
+concurrency:
+  group: trae-checkin-2
+  cancel-in-progress: false
+
+jobs:
+  checkin2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: 执行签到
+        id: first
+        continue-on-error: true
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GIST2_ID: ${{ secrets.GIST2_ID }}
+          RUNNER: github-actions
+        run: |
+          mkdir -p trae_auto2
+          curl -sS -o trae_auto2/checkin_cloud2.py \
+            "${{ github.server_url }}/${{ github.repository }}/raw/main/trae_auto2/checkin_cloud2.py"
+          if [ ! -s trae_auto2/checkin_cloud2.py ]; then
+            echo "❌ 下载脚本失败"; exit 1
+          fi
+          if [ "${{ github.event.inputs.mode }}" = "run" ]; then
+            python3 trae_auto2/checkin_cloud2.py
+          else
+            python3 trae_auto2/checkin_cloud2.py status
+          fi
+
+      - name: 失败重试（仅当首次失败）
+        if: steps.first.outcome == 'failure' && github.event_name == 'schedule'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GIST2_ID: ${{ secrets.GIST2_ID }}
+          RUNNER: github-actions-retry
+        run: |
+          echo "首次失败，3 分钟后重试"
+          sleep 180
+          python3 trae_auto2/checkin_cloud2.py
