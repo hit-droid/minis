@@ -133,6 +133,33 @@ def trae(path, cred, body=None):
         return st, {"_raw": raw[:200]}
 
 
+def sync_cronjob(cred):
+    """把最新 token / 设备号同步到 cron-job.org 的备用任务。
+
+    为什么需要：cron-job.org 的 header 是静态的，不会自己跟着 token 轮换。
+    不同步的话，token 一过期（14 天）这条备用路径就静默失效了。
+    没配 CRONJOB_API_KEY 就跳过，不影响主流程。
+    """
+    key = os.environ.get("CRONJOB_API_KEY", "")
+    job = os.environ.get("CRONJOB_JOB2_ID", "")
+    if not key or not job:
+        log("ℹ 未配置 CRONJOB_API_KEY / CRONJOB_JOB2_ID，跳过 cron-job 同步")
+        return
+    payload = {"job": {"enabled": True, "extendedData": {
+        "headers": {
+            "Authorization": "Cloud-IDE-JWT " + cred["accessToken"],
+            "Content-Type": "application/json",
+            "X-User-Region": "CN",
+            "x-device-id": str(cred["deviceId"]),
+        },
+        "body": "{}",
+    }}}
+    st, raw = http("PATCH", f"https://api.cron-job.org/jobs/{job}",
+                   {"Authorization": "Bearer " + key,
+                    "Content-Type": "application/json"}, payload, 40)
+    log(f"cron-job 同步 http={st}" + ("" if st == 200 else f" {raw[:120]}"))
+
+
 def main():
     action = sys.argv[1] if len(sys.argv) > 1 else "run"
     if not GH_TOKEN or not GIST_ID:
@@ -230,6 +257,7 @@ def main():
             log("✔ 凭证与记账本已写回 Gist")
         else:
             log("⚠ 写回 Gist 失败（凭证未持久化，下次仍用旧号）")
+        sync_cronjob(cred)
         return 0
 
     log(f"❌ 签到失败 code={r.get('code')} msg={r.get('message')}")
