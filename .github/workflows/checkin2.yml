@@ -1,8 +1,11 @@
 name: Trae 第二账号签到
 
 # 独立于主账号 checkin.yml —— 不同 Gist、不同 secrets、不同 concurrency group。
-# 触发点与主账号错开（主账号 :05/:25/:45，这里用 :15/:35/:55），
-# 避免两个号在同一时刻打同一台服务器。
+# 触发点与主账号错开（主账号 :05/:25/:45，这里用 :15/:35/:55）。
+#
+# 注意：这里**故意不加 continue-on-error**。
+# 2026-10-18 教训：加了 continue-on-error 后，下载脚本失败也会被记成 success，
+# 造成"假成功"。宁可失败报警，也不要静默。
 
 on:
   schedule:
@@ -33,33 +36,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
+      - name: 拉取脚本
+        run: |
+          mkdir -p trae_auto2
+          URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/trae_auto2/checkin_cloud2.py"
+          echo "下载: $URL"
+          curl -fsSL --retry 3 --retry-delay 2 -o trae_auto2/checkin_cloud2.py "$URL"
+          test -s trae_auto2/checkin_cloud2.py
+          head -3 trae_auto2/checkin_cloud2.py
+          echo "✔ 脚本下载成功 ($(wc -c < trae_auto2/checkin_cloud2.py) 字节)"
+
       - name: 执行签到
-        id: first
-        continue-on-error: true
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           GIST2_ID: ${{ secrets.GIST2_ID }}
           RUNNER: github-actions
         run: |
-          mkdir -p trae_auto2
-          curl -sS -o trae_auto2/checkin_cloud2.py \
-            "${{ github.server_url }}/${{ github.repository }}/raw/main/trae_auto2/checkin_cloud2.py"
-          if [ ! -s trae_auto2/checkin_cloud2.py ]; then
-            echo "❌ 下载脚本失败"; exit 1
-          fi
-          if [ "${{ github.event.inputs.mode }}" = "run" ]; then
-            python3 trae_auto2/checkin_cloud2.py
-          else
+          if [ "${{ github.event.inputs.mode }}" = "status" ]; then
             python3 trae_auto2/checkin_cloud2.py status
+          else
+            python3 trae_auto2/checkin_cloud2.py
           fi
-
-      - name: 失败重试（仅当首次失败）
-        if: steps.first.outcome == 'failure' && github.event_name == 'schedule'
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-          GIST2_ID: ${{ secrets.GIST2_ID }}
-          RUNNER: github-actions-retry
-        run: |
-          echo "首次失败，3 分钟后重试"
-          sleep 180
-          python3 trae_auto2/checkin_cloud2.py
