@@ -50,6 +50,8 @@ jobs:
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
           GIST2_ID: ${{ secrets.GIST2_ID }}
+          CRONJOB_API_KEY: ${{ secrets.CRONJOB_API_KEY }}
+          CRONJOB_JOB2_ID: "8664362"
           RUNNER: github-actions
         run: |
           if [ "${{ github.event.inputs.mode }}" = "status" ]; then
